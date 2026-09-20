@@ -7,8 +7,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <cinttypes>
+#include <cstdint>
 #include <string>
 #include <vector>
+#include <algorithm>
 #include <sstream>
 #include <fstream>
 #include <unistd.h>
@@ -426,4 +428,160 @@ void il2cpp_dump(const char *outDir) {
     }
     outStream.close();
     LOGI("dump done!");
+}
+
+// ---------------------------------------------------------------------------
+// dump_libil2cpp_so
+//   Walks /proc/self/maps, collects every page-range that belongs to
+//   libil2cpp.so and writes them sequentially to a flat binary file.
+//
+//   Why this works with Il2CppDumper:
+//     The offline tool has a "Load from il2cpp.so that is a dump?" option.
+//     In that mode it treats the file as a raw memory image (VA = file offset)
+//     rather than a proper ELF — exactly what we produce here.
+//
+//   Output: <outDir>/files/libil2cpp_dumped.so
+// ---------------------------------------------------------------------------
+void dump_libil2cpp_so(const char *outDir) {
+    LOGI("dump_libil2cpp_so: scanning /proc/self/maps ...");
+
+    FILE *maps = fopen("/proc/self/maps", "r");
+    if (!maps) {
+        LOGE("dump_libil2cpp_so: cannot open /proc/self/maps");
+        return;
+    }
+
+    struct Region {
+        uintptr_t start;
+        uintptr_t end;
+    };
+    std::vector<Region> regions;
+    uintptr_t base_addr = 0;
+
+    char line[512];
+    while (fgets(line, sizeof(line), maps)) {
+        if (!strstr(line, "libil2cpp.so")) continue;
+        uintptr_t start = 0, end = 0;
+        if (sscanf(line, "%" SCNxPTR "-%" SCNxPTR, &start, &end) != 2) continue;
+        regions.push_back({start, end});
+        if (base_addr == 0) base_addr = start;
+    }
+    fclose(maps);
+
+    if (regions.empty()) {
+        LOGE("dump_libil2cpp_so: libil2cpp.so not found in maps");
+        return;
+    }
+
+    // Sort by start address (maps is usually sorted, but be safe)
+    std::sort(regions.begin(), regions.end(),
+              [](const Region &a, const Region &b){ return a.start < b.start; });
+
+    uintptr_t total_end = regions.back().end;
+    size_t total_size   = total_end - base_addr;
+    LOGI("dump_libil2cpp_so: base=0x%" PRIxPTR " total_size=%zu (%zu regions)",
+         base_addr, total_size, regions.size());
+
+    auto outPath = std::string(outDir) + "/files/libil2cpp_dumped.so";
+    FILE *out = fopen(outPath.c_str(), "wb");
+    if (!out) {
+        LOGE("dump_libil2cpp_so: cannot open output %s", outPath.c_str());
+        return;
+    }
+
+    uintptr_t cursor = base_addr;
+    for (auto &r : regions) {
+        // Fill any gap between consecutive regions with zeros
+        if (r.start > cursor) {
+            size_t gap = r.start - cursor;
+            std::vector<uint8_t> zeros(gap, 0);
+            fwrite(zeros.data(), 1, gap, out);
+            cursor = r.start;
+        }
+        size_t len = r.end - r.start;
+        // Writing directly from mapped memory — pages are readable because
+        // we got them from /proc/self/maps with 'r' permission.
+        fwrite(reinterpret_cast<const void *>(r.start), 1, len, out);
+        cursor = r.end;
+    }
+    fclose(out);
+    LOGI("dump_libil2cpp_so: written to %s", outPath.c_str());
+}
+
+// ---------------------------------------------------------------------------
+// dump_global_metadata
+//   Scans every readable anonymous / heap mapping in the process for the
+//   universal il2cpp metadata magic header 0xFAB11BAF, then writes the
+//   entire region verbatim.
+//
+//   This finds the DECRYPTED metadata regardless of what the game does on
+//   disk, because il2cpp always calls il2cpp_init → loads metadata into a
+//   malloc'd heap region → the first four bytes are always the magic.
+//
+//   No size upper bound is applied so we never accidentally miss a large
+//   metadata blob.
+//
+//   Output: <outDir>/files/global-metadata.dat
+// ---------------------------------------------------------------------------
+void dump_global_metadata(const char *outDir) {
+    LOGI("dump_global_metadata: scanning for magic 0xFAB11BAF ...");
+
+    FILE *maps = fopen("/proc/self/maps", "r");
+    if (!maps) {
+        LOGE("dump_global_metadata: cannot open /proc/self/maps");
+        return;
+    }
+
+    static const uint32_t METADATA_MAGIC = 0xFAB11BAF;
+    // Minimum sensible size for a metadata file (1 MB)
+    static const size_t   MIN_SIZE       = 1 * 1024 * 1024;
+
+    char line[512];
+    bool found = false;
+
+    while (!found && fgets(line, sizeof(line), maps)) {
+        uintptr_t start = 0, end = 0;
+        char perms[8] = {};
+        char dev[16]  = {};
+        unsigned long inode = 0;
+        // format: start-end perms offset dev inode [path]
+        int matched = sscanf(line, "%" SCNxPTR "-%" SCNxPTR " %7s %*s %15s %lu",
+                             &start, &end, perms, dev, &inode);
+        if (matched < 3) continue;
+
+        // Must be readable
+        if (perms[0] != 'r') continue;
+
+        size_t sz = end - start;
+
+        // Must be at least MIN_SIZE
+        if (sz < MIN_SIZE) continue;
+
+        // Skip file-backed mappings (dev != "00:00" means backed by a real file)
+        // We want anonymous or heap regions only.
+        if (matched >= 4 && inode != 0) continue;
+
+        // Check the magic at the very start of the region
+        const uint32_t *magic_ptr = reinterpret_cast<const uint32_t *>(start);
+        if (*magic_ptr != METADATA_MAGIC) continue;
+
+        LOGI("dump_global_metadata: found at 0x%" PRIxPTR " size=%zu bytes (%.1f MB)",
+             start, sz, (double)sz / (1024.0 * 1024.0));
+
+        auto outPath = std::string(outDir) + "/files/global-metadata.dat";
+        FILE *out = fopen(outPath.c_str(), "wb");
+        if (!out) {
+            LOGE("dump_global_metadata: cannot open output %s", outPath.c_str());
+            break;
+        }
+        size_t written = fwrite(reinterpret_cast<const void *>(start), 1, sz, out);
+        fclose(out);
+        LOGI("dump_global_metadata: wrote %zu bytes to %s", written, outPath.c_str());
+        found = true;
+    }
+    fclose(maps);
+
+    if (!found) {
+        LOGE("dump_global_metadata: magic not found — il2cpp may not be initialized yet");
+    }
 }
