@@ -19,11 +19,15 @@
 
 void hack_start(const char *game_data_dir) {
     bool load = false;
-    for (int i = 0; i < 10; i++) {
+    for (int i = 0; i < 30; i++) {
         void *handle = xdl_open("libil2cpp.so", 0);
         if (handle) {
             load = true;
             il2cpp_api_init(handle);
+            // Dump decrypted binary files for offline Il2CppDumper tool
+            dump_libil2cpp_so(game_data_dir);
+            dump_global_metadata(game_data_dir);
+            // Also keep the existing human-readable dump.cs
             il2cpp_dump(game_data_dir);
             break;
         } else {
